@@ -1,0 +1,8 @@
+# Tidak ada binary yang di-track di git. Core sing-box (libbox.aar) dibangun
+# oleh .github/workflows/build-core.yml dan diterbitkan di rilis "core";
+# ambil dengan scripts/fetch-core.sh.
+
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.jar binary

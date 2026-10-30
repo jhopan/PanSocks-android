@@ -1,0 +1,172 @@
+name: Build Core
+
+# Membangun core sing-box minimal yang dipakai PanSocks: libbox.aar untuk
+# Android. Hanya yang dibutuhkan klien SOCKS5 - socks / http / mixed / tun /
+# direct / block / dns. Fitur opsional (quic, wireguard, utls, clash-api,
+# tailscale, naive, usbip, openvpn, openconnect, acme, dhcp, cloudflared)
+# sengaja tidak dikompilasi.
+#
+# Hasilnya masuk ke rilis "core" (tidak pernah ditandai latest), dan
+# scripts/fetch-core.sh mengunduhnya saat build APK.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: sing-box tag to build
+        required: false
+        default: v1.14.1
+      slim:
+        description: trim the protocol registry (socks/http/mixed/tun/direct/block/dns only)
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'core*'
+
+permissions:
+  contents: write
+
+env:
+  SB_VERSION: ${{ inputs.version || 'v1.14.1' }}
+  SLIM: ${{ github.event_name != 'workflow_dispatch' || inputs.slim }}
+
+jobs:
+  android:
+    name: core android (libbox.aar)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone sing-box ${{ env.SB_VERSION }}
+        run: git clone --depth 1 --branch "${SB_VERSION}" https://github.com/SagerNet/sing-box.git src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+          add-to-path: false
+
+      - name: Trim protocol registry
+        if: env.SLIM == 'true'
+        run: python3 core/slim-registry.py src/include/registry.go
+
+      - name: Install gomobile
+        run: |
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build libbox.aar
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd src
+          gomobile bind -v -o ../dist/libbox.aar \
+            -target "android/arm64,android/arm" -androidapi 24 \
+            -javapkg=io.nekohasekai -libname=box \
+            -trimpath -buildvcs=false \
+            -ldflags "-s -w -buildid= -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384 -X github.com/sagernet/sing-box/constant.Version=${SB_VERSION}-minimal" \
+            -tags "with_gvisor,badlinkname,tfogo_checklinkname0" ./experimental/libbox
+          cd ..
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-android
+          path: dist/libbox.aar
+          if-no-files-found: error
+
+  verify:
+    name: verify the slim core accepts the Android configs
+    needs: [android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone sing-box ${{ env.SB_VERSION }}
+        run: git clone --depth 1 --branch "${SB_VERSION}" https://github.com/SagerNet/sing-box.git src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: Trim protocol registry
+        if: env.SLIM == 'true'
+        run: python3 core/slim-registry.py src/include/registry.go
+
+      - name: Build linux core for validation
+        run: |
+          set -euo pipefail
+          cd src
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -buildid=" -o ../sing-box ./cmd/sing-box
+          cd ..
+          ./sing-box version
+
+      - name: sing-box check on config fixtures
+        run: |
+          set -euo pipefail
+          for f in config.*.json; do
+            echo "::group::check $f"
+            ./sing-box check -c "$f"
+            echo "::endgroup::"
+          done
+
+  release:
+    name: publish "core" release
+    needs: [android, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -lh out
+          sha256sum out/libbox.aar > out/SHA256SUMS.txt
+          cat out/SHA256SUMS.txt
+          notes="Minimal sing-box core for PanSocks (Android).
+
+          Built from sing-box ${SB_VERSION} without any optional build tag, so it
+          contains only the inbounds/outbounds a SOCKS5 client uses: socks, http,
+          mixed, tun, direct, block, dns. No quic, wireguard, utls, clash-api,
+          tailscale, naive, usbip, openvpn, openconnect, acme, dhcp or cloudflared.
+
+          Protocol registry trimmed (core/slim-registry.py): vless, vmess, trojan,
+          shadowsocks, shadowtls, snell, ssh, tor, anytls, naive, bridge, groups,
+          clash-api, mdns/fakeip/hosts/resolved DNS transports are not compiled in.
+          Built with with_gvisor so the gvisor TUN stack the client pins is present
+          at runtime, and with 16 KB page alignment for Android 15/16.
+
+          | Asset | Target |
+          |---|---|
+          | libbox.aar | Android: arm64-v8a, armeabi-v7a |
+
+          A verify job runs 'sing-box check' on the config fixtures before anything
+          is published."
+          R="-R $GITHUB_REPOSITORY"
+          if gh release view core $R >/dev/null 2>&1; then
+            gh release edit core $R --title "core" --notes "$notes" --latest=false
+          else
+            gh release create core $R --title "core" --notes "$notes" --latest=false
+          fi
+          gh release upload core $R out/* --clobber
+          gh release view core $R --json assets --jq '.assets[].name'

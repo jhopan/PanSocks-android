@@ -1,0 +1,169 @@
+name: Build & Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission
+        run: chmod +x gradlew
+
+      - name: Fetch core (libbox.aar)
+        run: bash scripts/fetch-core.sh
+
+      # APK rilis ditandatangani kunci rilis (rahasia repo), bukan kunci debug.
+      # Kalau secret belum ada, langkah ini gagal - sengaja, supaya tidak pernah
+      # ada rilis yang diam-diam ditandatangani kunci debug.
+      - name: Prepare release keystore
+        run: |
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "::error::KEYSTORE_BASE64 belum diisi - rilis ditolak"
+            exit 1
+          fi
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+          echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+
+      - name: Build Release APKs
+        run: ./gradlew :app:assembleRelease
+
+      - name: Verify APK signature
+        run: |
+          cd app/build/outputs/apk/release
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          for apk in *.apk; do
+            echo "--- $apk"
+            "$APKSIGNER" verify --print-certs "$apk" | sed -n '1,3p'
+            if "$APKSIGNER" verify --print-certs "$apk" | grep -qi "Android Debug"; then
+              echo "::error::$apk is signed with the debug key"
+              exit 1
+            fi
+          done
+
+      - name: Rename APKs
+        run: |
+          cd app/build/outputs/apk/release
+          VERSION=$(grep 'versionName' ../../../../build.gradle.kts | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          mv app-arm64-v8a-release.apk "PanSocks-${VERSION}-arm64-v8a.apk"
+          mv app-armeabi-v7a-release.apk "PanSocks-${VERSION}-armeabi-v7a.apk"
+          mv app-universal-release.apk "PanSocks-${VERSION}-universal.apk"
+          ls -lh *.apk
+
+      - name: Write SHA256SUMS
+        run: |
+          cd app/build/outputs/apk/release
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload APKs as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PanSocks-APKs
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS.txt
+
+      # Kebijakan rilis: hanya rilis APK terbaru yang dipertahankan supaya
+      # halaman Releases tetap bersih. Tag git-nya tidak dihapus.
+      # `|| true` pada grep penting - kalau tidak ada rilis lama, grep keluar 1
+      # dan `-o pipefail` menggagalkan step ini.
+      - name: Delete superseded releases
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          old=$(gh release list --limit 100 --json tagName --jq '.[].tagName' \
+                  | grep -E '^v[0-9]' | grep -v "^v${{ env.VERSION }}$" || true)
+          for tag in $old; do
+            echo "menghapus rilis lama: $tag"
+            gh release delete "$tag" --yes || true
+          done
+
+      # Re-run harus idempotent: kalau rilis untuk tag ini sudah ada, hapus dulu
+      # supaya upload aset tidak bentrok.
+      - name: Reset current release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ github.ref_name }}" --yes 2>/dev/null || true
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS.txt
+          name: "PanSocks ${{ env.VERSION }}"
+          body: |
+            ## PanSocks ${{ env.VERSION }} - Android
+
+            SOCKS5 tunnel client. **Semua** trafik keluar dari HP lewat server SOCKS5
+            kamu - TCP, UDP dan DNS - tanpa DNS leak dan tanpa jalur IPv6. Dibuat
+            untuk hotspot mobile: stack TUN dipaku ke `gvisor`, MTU `1400`, DNS
+            ditangkap di dalam tunnel.
+
+            ### Download
+            | File | Arsitektur | Untuk |
+            |------|------------|-------|
+            | `PanSocks-${{ env.VERSION }}-arm64-v8a.apk` | arm64-v8a (64-bit) | hampir semua HP dari ~2016 ke atas |
+            | `PanSocks-${{ env.VERSION }}-armeabi-v7a.apk` | armeabi-v7a (32-bit) | HP lama / low-end |
+            | `PanSocks-${{ env.VERSION }}-universal.apk` | semua ABI | kalau ragu; ukuran lebih besar |
+
+            ### Isi build ini
+            - Mode TUN saja, di atas core sing-box 1.14.1 minimal (socks/http/mixed/tun/direct/block/local-DNS - tanpa protokol yang tidak dipakai)
+            - Stack TUN `gvisor`, MTU `1400`
+            - DNS tidak bisa bocor: DNS VPN + `hijack-dns`, tidak ada resolver publik di layer OS, IPv6 masuk tunnel lalu di-reject
+            - `HTTP ping` On/Off: `GET http://www.gstatic.com/generate_204` tiap 30 detik, sekaligus menjaga jalur SOCKS tetap hangat; Off berarti nol trafik tambahan
+            - Tahan ganti jaringan (callback default-network memuat ulang sing-box) dan layar mati (foreground service `systemExempted`, heartbeat 10 detik)
+            - Password server disimpan terenkripsi dengan kunci AES-GCM Android Keystore
+            - Alamat server harus **IP literal** - hostname akan di-resolve di luar tunnel
+
+            ### Install
+            1. Unduh APK sesuai arsitektur HP.
+            2. Buka dan izinkan instalasi dari sumber ini bila Android bertanya.
+            3. Jalankan, isi IP server dan port (plus user/password bila server meminta), tekan **Connect** dan setujui prompt VPN.
+            4. Build berikutnya bisa menimpa build ini tanpa uninstall, karena semua rilis ditandatangani kunci proyek yang sama.
+
+            ```bash
+            adb install -r PanSocks-${{ env.VERSION }}-arm64-v8a.apk
+            ```
+
+            ### Verifikasi unduhan
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            ### Kebutuhan
+            - Android 7.0 atau lebih baru (minSdk 24), arm64-v8a atau armeabi-v7a
+            - Server SOCKS5 yang bisa dijangkau dan menerima TCP (opsional UDP associate)
+
+            ### Link
+            - Tunnel core (sing-box, dibangun di repo ini): rilis `core`
+            - Source, checklist QA dan tabel troubleshooting: lihat README repo
+          draft: false
+          prerelease: false

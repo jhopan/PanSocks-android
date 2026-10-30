@@ -1,0 +1,33 @@
+# Build outputs
+*.apk
+*.aab
+*.ap_
+build/
+app/build/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Gradle
+.gradle/
+local.properties
+captures/
+
+# Build input yang diunduh dari rilis "core" - jangan pernah di-commit
+app/libs/libbox.aar
+app/libs/libbox-full.aar
+
+# Signing material
+*.jks
+*.keystore
+keystore.properties
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Working files ikon (master disimpan di docs/logo.png)
+_icon/

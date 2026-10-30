@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 11 ke bawah memakai fullBackupContent. Sama seperti dataExtractionRules:
+  kredensial SOCKS tidak boleh ikut backup. allowBackup="false" sudah menutup
+  semuanya, ini hanya lapis kedua supaya lint bersih dan niatnya eksplisit.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="file" path="." />
+</full-backup-content>

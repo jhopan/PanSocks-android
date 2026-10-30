@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  allowBackup="false" sudah mematikan backup, tapi Android 12+ memakai
+  dataExtractionRules. Isinya sama-sama menolak: kredensial SOCKS tidak boleh
+  ikut ke cloud atau pindah perangkat lewat transfer.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
+    </device-transfer>
+</data-extraction-rules>
