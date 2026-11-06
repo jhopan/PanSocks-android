@@ -49,17 +49,36 @@ jobs:
       - name: Build Release APKs
         run: ./gradlew :app:assembleRelease
 
+      # Dua penjaga, keduanya wajib:
+      #  1. tolak kunci debug (kunci debug publik, APK-nya tidak bisa di-update
+      #     setelah pindah ke kunci rilis),
+      #  2. pastikan fingerprint sertifikat PERSIS sama dengan yang dipin di bwh.
+      #     Tanpa pin ini, build yang tidak sengaja memakai keystore lain tetap
+      #     lolos dan pembeli tidak bisa update di atas versi sebelumnya.
       - name: Verify APK signature
+        env:
+          EXPECTED_CERT_SHA256: d634a65603dbdce87115e9cca5f4afd557ca441f15d87fcef1bd34edbbbf8cd6
         run: |
+          set -euo pipefail
           cd app/build/outputs/apk/release
           APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
           for apk in *.apk; do
             echo "--- $apk"
-            "$APKSIGNER" verify --print-certs "$apk" | sed -n '1,3p'
-            if "$APKSIGNER" verify --print-certs "$apk" | grep -qi "Android Debug"; then
+            CERTS=$("$APKSIGNER" verify --print-certs "$apk")
+            echo "$CERTS" | sed -n '1,3p'
+            if echo "$CERTS" | grep -qi "Android Debug"; then
               echo "::error::$apk is signed with the debug key"
               exit 1
             fi
+            ACTUAL=$(echo "$CERTS" | grep -i "SHA-256 digest" | head -1 \
+                     | sed 's/.*digest: *//' | tr -d ' \r' | tr 'A-Z' 'a-z')
+            if [ "$ACTUAL" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::$apk signature mismatch"
+              echo "  expected: $EXPECTED_CERT_SHA256"
+              echo "  actual  : $ACTUAL"
+              exit 1
+            fi
+            echo "OK: sertifikat cocok dengan yang dipin"
           done
 
       - name: Rename APKs
@@ -118,52 +137,64 @@ jobs:
           files: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
-          name: "PanSocks ${{ env.VERSION }}"
+          name: "PanSocks ${{ env.VERSION }} — Android"
           body: |
-            ## PanSocks ${{ env.VERSION }} - Android
+            ## PanSocks ${{ env.VERSION }} — Android
 
-            SOCKS5 tunnel client. **Semua** trafik keluar dari HP lewat server SOCKS5
-            kamu - TCP, UDP dan DNS - tanpa DNS leak dan tanpa jalur IPv6. Dibuat
-            untuk hotspot mobile: stack TUN dipaku ke `gvisor`, MTU `1400`, DNS
-            ditangkap di dalam tunnel.
+            **Yang baru**
 
-            ### Download
-            | File | Arsitektur | Untuk |
-            |------|------------|-------|
-            | `PanSocks-${{ env.VERSION }}-arm64-v8a.apk` | arm64-v8a (64-bit) | hampir semua HP dari ~2016 ke atas |
-            | `PanSocks-${{ env.VERSION }}-armeabi-v7a.apk` | armeabi-v7a (32-bit) | HP lama / low-end |
-            | `PanSocks-${{ env.VERSION }}-universal.apk` | semua ABI | kalau ragu; ukuran lebih besar |
+            - Ukuran APK turun **88%**: 51,5 MB -> 5,9 MB. Tiga penyebabnya:
+              `libbox.so` tidak dikompres di APK, build tag `badlinkname` yang
+              membuat tabel relokasi membengkak ~8x, dan core sing-box v1.14
+              yang jauh lebih besar.
+            - Core dipaku ke **sing-box v1.11.15** (sama seperti PanTunnel).
+            - **Preflight**: TCP + handshake SOCKS5 diperiksa dulu. Server mati
+              atau password salah ketahuan dalam detik, dan tunnel tidak pernah naik.
+            - **Counter traffic diperbaiki**. Statistik interface tidak bisa dibaca
+              app (dilindungi SELinux), jadi sekarang dihitung per-uid lewat
+              `TrafficStats`. Dihitung per sesi: mulai 0 saat connect, dihapus
+              saat disconnect.
+            - **UI tidak lagi macet** di "Menyiapkan VPN..." dengan tombol yang
+              tidak bisa ditekan.
+            - Menu titik tiga: toggle **HTTP ping** dan **Counter** (centang = hidup).
+            - Header dihapus, status dan counter menempel di bawah tombol Connect.
 
-            ### Isi build ini
-            - Mode TUN saja, di atas core sing-box 1.14.1 minimal (socks/http/mixed/tun/direct/block/local-DNS - tanpa protokol yang tidak dipakai)
-            - Stack TUN `gvisor`, MTU `1400`
-            - DNS tidak bisa bocor: DNS VPN + `hijack-dns`, tidak ada resolver publik di layer OS, IPv6 masuk tunnel lalu di-reject
-            - `HTTP ping` On/Off: `GET http://www.gstatic.com/generate_204` tiap 30 detik, sekaligus menjaga jalur SOCKS tetap hangat; Off berarti nol trafik tambahan
-            - Tahan ganti jaringan (callback default-network memuat ulang sing-box) dan layar mati (foreground service `systemExempted`, heartbeat 10 detik)
-            - Password server disimpan terenkripsi dengan kunci AES-GCM Android Keystore
-            - Alamat server harus **IP literal** - hostname akan di-resolve di luar tunnel
+            ### Pilih file
 
-            ### Install
+            | File | Untuk siapa | Ukuran |
+            |---|---|---|
+            | **`PanSocks-${{ env.VERSION }}-arm64-v8a.apk`** | **Rekomendasi** — HP 2016+, arm64-v8a | 5,9 MB |
+            | `PanSocks-${{ env.VERSION }}-armeabi-v7a.apk` | HP lama, armeabi-v7a 32-bit | 5,9 MB |
+            | `PanSocks-${{ env.VERSION }}-universal.apk` | Semua HP (kalau ragu) | 11,7 MB |
+
+            ### Cara pakai
+
             1. Unduh APK sesuai arsitektur HP.
-            2. Buka dan izinkan instalasi dari sumber ini bila Android bertanya.
-            3. Jalankan, isi IP server dan port (plus user/password bila server meminta), tekan **Connect** dan setujui prompt VPN.
-            4. Build berikutnya bisa menimpa build ini tanpa uninstall, karena semua rilis ditandatangani kunci proyek yang sama.
+            2. Buka, izinkan instalasi dari sumber ini bila Android bertanya.
+            3. Isi **Host** (IP server) dan **Port**, lalu tekan **Connect**.
+            4. Setujui permintaan VPN.
 
-            ```bash
-            adb install -r PanSocks-${{ env.VERSION }}-arm64-v8a.apk
+            Host wajib **IP literal** (contoh `10.12.132.225`), bukan hostname —
+            hostname akan di-resolve di luar tunnel dan bocor DNS.
+
+            ### Update dari versi sebelumnya
+
+            Bisa langsung install di atas v1.0.0 — sertifikat sama, setelan tidak hilang.
+
+            ### Verifikasi
+
+            ```
+            SHA-256 sertifikat: d634a65603dbdce87115e9cca5f4afd557ca441f15d87fcef1bd34edbbbf8cd6
             ```
 
-            ### Verifikasi unduhan
             ```bash
             sha256sum -c SHA256SUMS.txt
             ```
 
-            ### Kebutuhan
-            - Android 7.0 atau lebih baru (minSdk 24), arm64-v8a atau armeabi-v7a
-            - Server SOCKS5 yang bisa dijangkau dan menerima TCP (opsional UDP associate)
+            Cek sendiri sertifikatnya:
 
-            ### Link
-            - Tunnel core (sing-box, dibangun di repo ini): rilis `core`
-            - Source, checklist QA dan tabel troubleshooting: lihat README repo
+            ```bash
+            apksigner verify --print-certs PanSocks-${{ env.VERSION }}-arm64-v8a.apk
+            ```
           draft: false
           prerelease: false

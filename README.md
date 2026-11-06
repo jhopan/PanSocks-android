@@ -162,6 +162,26 @@ workflow **Build Core** dulu (atau bangun sendiri dari
 base64 -w0 pansocks-release.jks | gh secret set KEYSTORE_BASE64 -R jhopan/PanSocks-android
 ```
 
+### Verifikasi APK
+
+Semua rilis ditandatangani kunci proyek. Fingerprint yang harus cocok:
+
+```
+SHA-256: d634a65603dbdce87115e9cca5f4afd557ca441f15d87fcef1bd34edbbbf8cd6
+Subject: CN=PanSocks, OU=JhopanStore, O=JhopanStore, L=Jakarta, ST=Jakarta, C=ID
+```
+
+```bash
+apksigner verify --print-certs PanSocks-<versi>-arm64-v8a.apk
+sha256sum -c SHA256SUMS.txt
+```
+
+Fingerprint berbeda = APK bukan dari proyek ini. Jangan dipasang.
+
+Workflow rilis menolak build yang ditandatangani kunci debug: kalau
+`KEYSTORE_BASE64` belum diisi, job gagal alih-alih menerbitkan APK yang tidak
+bisa di-update.
+
 ## Konfigurasi
 
 ### DNS
