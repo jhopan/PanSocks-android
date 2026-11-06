@@ -91,6 +91,15 @@ jobs:
           mv app-universal-release.apk "PanSocks-${VERSION}-universal.apk"
           ls -lh *.apk
 
+          # Ukuran dihitung dari file hasil build, bukan ditulis tangan di
+          # catatan rilis - angka manual pasti basi begitu APK mengecil/membesar.
+          mb() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1048576}'; }
+          {
+            echo "SIZE_V8=$(mb $(stat -c%s "PanSocks-${VERSION}-arm64-v8a.apk"))"
+            echo "SIZE_V7=$(mb $(stat -c%s "PanSocks-${VERSION}-armeabi-v7a.apk"))"
+            echo "SIZE_UNIV=$(mb $(stat -c%s "PanSocks-${VERSION}-universal.apk"))"
+          } >> $GITHUB_ENV
+
       - name: Write SHA256SUMS
         run: |
           cd app/build/outputs/apk/release
@@ -104,22 +113,6 @@ jobs:
           path: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
-
-      # Kebijakan rilis: hanya rilis APK terbaru yang dipertahankan supaya
-      # halaman Releases tetap bersih. Tag git-nya tidak dihapus.
-      # `|| true` pada grep penting - kalau tidak ada rilis lama, grep keluar 1
-      # dan `-o pipefail` menggagalkan step ini.
-      - name: Delete superseded releases
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          old=$(gh release list --limit 100 --json tagName --jq '.[].tagName' \
-                  | grep -E '^v[0-9]' | grep -v "^v${{ env.VERSION }}$" || true)
-          for tag in $old; do
-            echo "menghapus rilis lama: $tag"
-            gh release delete "$tag" --yes || true
-          done
 
       # Re-run harus idempotent: kalau rilis untuk tag ini sudah ada, hapus dulu
       # supaya upload aset tidak bentrok.
@@ -138,6 +131,9 @@ jobs:
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
           name: "PanSocks ${{ env.VERSION }} — Android"
+          # CATATAN: bagian "Yang baru" ditulis untuk versi ini dan harus
+          # diperbarui setiap kali menaikkan versi. Bagian "Pilih file" sudah
+          # otomatis (ukuran dihitung dari APK hasil build).
           body: |
             ## PanSocks ${{ env.VERSION }} — Android
 
@@ -163,9 +159,9 @@ jobs:
 
             | File | Untuk siapa | Ukuran |
             |---|---|---|
-            | **`PanSocks-${{ env.VERSION }}-arm64-v8a.apk`** | **Rekomendasi** — HP 2016+, arm64-v8a | 5,9 MB |
-            | `PanSocks-${{ env.VERSION }}-armeabi-v7a.apk` | HP lama, armeabi-v7a 32-bit | 5,9 MB |
-            | `PanSocks-${{ env.VERSION }}-universal.apk` | Semua HP (kalau ragu) | 11,7 MB |
+            | **`PanSocks-${{ env.VERSION }}-arm64-v8a.apk`** | **Rekomendasi** — HP 2016+, arm64-v8a | ${{ env.SIZE_V8 }} MB |
+            | `PanSocks-${{ env.VERSION }}-armeabi-v7a.apk` | HP lama, armeabi-v7a 32-bit | ${{ env.SIZE_V7 }} MB |
+            | `PanSocks-${{ env.VERSION }}-universal.apk` | Semua HP (kalau ragu) | ${{ env.SIZE_UNIV }} MB |
 
             ### Cara pakai
 
@@ -179,7 +175,7 @@ jobs:
 
             ### Update dari versi sebelumnya
 
-            Bisa langsung install di atas v1.0.0 — sertifikat sama, setelan tidak hilang.
+            Bisa langsung install di atas versi sebelumnya — sertifikat sama, setelan tidak hilang.
 
             ### Verifikasi
 
@@ -198,3 +194,31 @@ jobs:
             ```
           draft: false
           prerelease: false
+          # Eksplisit: rilis APK harus jadi "Latest". Rilis "core" ditandai
+          # --latest=false di workflow-nya, jadi tidak pernah saling rebutan.
+          make_latest: true
+
+      # Kebijakan rilis: hanya rilis APK terbaru yang dipertahankan supaya
+      # halaman Releases tetap bersih. Tag git-nya tidak dihapus.
+      #
+      # Dijalankan SETELAH rilis baru berhasil dibuat. Sebelumnya step ini ada
+      # di depan: kalau pembuatan rilis gagal, semua rilis lama sudah terhapus
+      # lebih dulu dan tinggal menyisakan nol rilis.
+      # `|| true` pada grep penting - kalau tidak ada rilis lama, grep keluar 1
+      # dan `-o pipefail` menggagalkan step ini.
+      - name: Delete superseded releases
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "::error::rilis ${{ github.ref_name }} tidak ada - pembuatan gagal, rilis lama tidak disentuh"
+            exit 1
+          fi
+          old=$(gh release list --limit 100 --json tagName --jq '.[].tagName' \
+                  | grep -E '^v[0-9]' | grep -v "^${{ github.ref_name }}$" || true)
+          for tag in $old; do
+            echo "menghapus rilis lama: $tag"
+            gh release delete "$tag" --yes || true
+          done
