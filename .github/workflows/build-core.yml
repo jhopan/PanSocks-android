@@ -44,9 +44,12 @@ jobs:
       - name: Clone sing-box ${{ env.SB_VERSION }}
         run: git clone --depth 1 --branch "${SB_VERSION}" https://github.com/SagerNet/sing-box.git src
 
+      # Go dipaku, TIDAK dibaca dari src/go.mod. go.mod sing-box v1.11.15
+      # menyatakan "go 1.20", sedangkan gomobile v0.1.13 memakai format
+      # "go 1.23.0" yang ditolak toolchain 1.20 -> install gomobile gagal.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: src/go.mod
+          go-version: '1.23'
           cache-dependency-path: src/go.sum
 
       - uses: actions/setup-java@v4
@@ -100,9 +103,12 @@ jobs:
       - name: Clone sing-box ${{ env.SB_VERSION }}
         run: git clone --depth 1 --branch "${SB_VERSION}" https://github.com/SagerNet/sing-box.git src
 
+      # Go dipaku, TIDAK dibaca dari src/go.mod. go.mod sing-box v1.11.15
+      # menyatakan "go 1.20", sedangkan gomobile v0.1.13 memakai format
+      # "go 1.23.0" yang ditolak toolchain 1.20 -> install gomobile gagal.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: src/go.mod
+          go-version: '1.23'
           cache-dependency-path: src/go.sum
 
       - name: Trim protocol registry
