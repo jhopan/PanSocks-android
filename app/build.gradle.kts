@@ -20,20 +20,26 @@ android {
         // Fitur baru -> naikkan versi normal (1.1.0).
         // Build ulang tanpa fitur baru -> tambah segmen keempat (1.1.0.1, ...).
         // versionCode selalu naik: major*10000 + minor*100 + patch*10 + build.
-        versionCode = 10000
-        versionName = "1.0.0"
+        versionCode = 10001
+        versionName = "1.0.1"
     }
 
     buildFeatures {
         buildConfig = true
     }
 
-    // libbox.so dimuat lewat System.loadLibrary dari AAR, dan APK universal
-    // berisi dua ABI sekaligus: simpan .so tidak terkompresi di dalam APK
-    // (useLegacyPackaging) supaya tidak perlu ekstrak ke data dir saat start.
+    // useLegacyPackaging = true membuat .so DIKOMPRES di dalam APK (deflate).
+    // Ini yang benar untuk core sing-box yang besar:
+    //
+    //   false (default) : libbox.so 51.4 MB disimpan apa adanya -> APK 51 MB
+    //   true            : libbox.so 51.4 MB -> ~15.5 MB di APK
+    //
+    // Harganya: Android mengekstrak .so ke data dir saat instalasi, jadi
+    // startup pertama sedikit lebih lambat dan butuh ruang ekstra sesaat.
+    // Untuk file 51 MB itu pertukaran yang jelas menang.
     packaging {
         jniLibs {
-            useLegacyPackaging = false
+            useLegacyPackaging = true
         }
     }
 

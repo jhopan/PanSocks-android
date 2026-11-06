@@ -1,10 +1,13 @@
 name: Build Core
 
 # Membangun core sing-box minimal yang dipakai PanSocks: libbox.aar untuk
-# Android. Hanya yang dibutuhkan klien SOCKS5 - socks / http / mixed / tun /
-# direct / block / dns. Fitur opsional (quic, wireguard, utls, clash-api,
-# tailscale, naive, usbip, openvpn, openconnect, acme, dhcp, cloudflared)
-# sengaja tidak dikompilasi.
+# Android. Hanya yang dibutuhkan klien SOCKS5 - socks / mixed / tun / direct /
+# block / dns. Fitur opsional (quic, wireguard, utls, clash-api, tailscale,
+# naive, usbip, openvpn, openconnect, acme, dhcp, cloudflared) tidak dikompilasi.
+#
+# Versi dipaku ke v1.11.15 karena itulah yang terbukti stabil di PanTunnel.
+# Build tag sengaja hanya "with_gvisor": tag badlinkname membuat tabel
+# relokasi (.data.rel.ro) membengkak ~8x sehingga libbox.so jadi 51 MB.
 #
 # Hasilnya masuk ke rilis "core" (tidak pernah ditandai latest), dan
 # scripts/fetch-core.sh mengunduhnya saat build APK.
@@ -15,7 +18,7 @@ on:
       version:
         description: sing-box tag to build
         required: false
-        default: v1.14.1
+        default: v1.11.15
       slim:
         description: trim the protocol registry (socks/http/mixed/tun/direct/block/dns only)
         type: boolean
@@ -28,7 +31,7 @@ permissions:
   contents: write
 
 env:
-  SB_VERSION: ${{ inputs.version || 'v1.14.1' }}
+  SB_VERSION: ${{ inputs.version || 'v1.11.15' }}
   SLIM: ${{ github.event_name != 'workflow_dispatch' || inputs.slim }}
 
 jobs:
@@ -74,10 +77,10 @@ jobs:
           cd src
           gomobile bind -v -o ../dist/libbox.aar \
             -target "android/arm64,android/arm" -androidapi 24 \
-            -javapkg=io.nekohasekai -libname=box \
+            -javapkg=io.github.sagernet.libbox -libname=gojni \
             -trimpath -buildvcs=false \
-            -ldflags "-s -w -buildid= -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384 -X github.com/sagernet/sing-box/constant.Version=${SB_VERSION}-minimal" \
-            -tags "with_gvisor,badlinkname,tfogo_checklinkname0" ./experimental/libbox
+            -ldflags "-s -w -buildid= -extldflags=-Wl,-z,max-page-size=16384 -X github.com/sagernet/sing-box/constant.Version=${SB_VERSION}-minimal" \
+            -tags "with_gvisor" ./experimental/libbox
           cd ..
           ls -lh dist/
 

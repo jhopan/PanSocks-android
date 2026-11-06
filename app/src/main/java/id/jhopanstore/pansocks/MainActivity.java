@@ -18,10 +18,10 @@ import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
-import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.view.MenuItem;
+import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -50,17 +50,16 @@ public class MainActivity extends Activity {
     private static final int DOT_OFF = Color.rgb(70, 76, 88);
 
     private static final int REQ_VPN = 300;
+    private static final int MENU_PING = 1;
+    private static final int MENU_COUNTER = 2;
+    private static final int MENU_ABOUT = 3;
     private static final int REQ_NOTIF = 40;
 
-    private static final String STATUS_PREFS = "pansocks_status";
-    private static final String KEY_CONNECTED = "connected";
-    private static final String KEY_STATUS = "status";
-    private static final String KEY_LAST_SEEN = "last_seen";
-    private static final String KEY_UP = "upload_bytes";
-    private static final String KEY_DOWN = "download_bytes";
-
-    /** Jendela toleransi heartbeat service (3x HEARTBEAT_MS di service). */
-    private static final long LAST_SEEN_WINDOW_MS = 45000;
+    // Semua state tunnel dibaca/ditulis lewat TunnelState - lihat komentar di
+    // kelas itu: dua skema berbeda pernah membuat UI macet di "Menyiapkan VPN...".
+    private static final String STATUS_PREFS = TunnelState.PREFS;
+    private static final String KEY_UP = TunnelState.KEY_UP;
+    private static final String KEY_DOWN = TunnelState.KEY_DOWN;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
@@ -116,7 +115,7 @@ public class MainActivity extends Activity {
                 startVpn();
             } else {
                 connectButton.setEnabled(true);
-                saveStatus(false, "Izin VPN ditolak");
+                saveState(TunnelState.PHASE_IDLE, "Izin VPN ditolak");
                 refreshUi();
             }
         }
@@ -133,30 +132,51 @@ public class MainActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(22), dp(28), dp(22), dp(28));
+        root.setPadding(dp(22), dp(12), dp(22), dp(22));
         scroll.addView(root, new ScrollView.LayoutParams(-1, -2));
 
-        // Header: logo + versi
-        ImageView logo = new ImageView(this);
-        logo.setImageResource(R.drawable.logo_pansocks);
-        logo.setAdjustViewBounds(true);
-        LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(-1, dp(88));
-        logoParams.gravity = Gravity.CENTER_HORIZONTAL;
-        root.addView(logo, logoParams);
+        // ── Top bar minimal: hanya menu titik tiga di kanan ──
+        // Judul/logo dihapus supaya layar bersih; identitas app sudah terlihat
+        // dari ikon launcher dan dari menu About.
+        LinearLayout topBar = new LinearLayout(this);
+        topBar.setOrientation(LinearLayout.HORIZONTAL);
+        topBar.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
 
-        try {
-            String vn = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-            TextView ver = text("v" + vn, 11, false, Color.rgb(92, 99, 112));
-            ver.setGravity(Gravity.CENTER);
-            root.addView(ver, marginTop(matchWrap(), 8));
-        } catch (Exception ignored) {
-        }
+        TextView overflow = text("\u22EE", 24, true, TEXT_SECONDARY);
+        overflow.setGravity(Gravity.CENTER);
+        overflow.setPadding(dp(10), dp(2), dp(10), dp(6));
+        overflow.setOnClickListener(this::showOverflowMenu);
+        topBar.addView(overflow, new LinearLayout.LayoutParams(-2, -2));
 
-        // Kartu status
+        root.addView(topBar, matchWrap());
+
+        // ── Field ──
+        hostInput = textInput("Contoh: 10.12.132.225", prefs.getString("host", ""));
+        portInput = numberInput("1080", prefs.getInt("port", 1080));
+        userInput = textInput("Kosongkan bila server tanpa auth", prefs.getString("user", ""));
+        String passPlain = SecurePrefs.decrypt(this, prefs.getString("pass_enc", null));
+        passInput = textInput("Kosongkan bila server tanpa auth",
+                passPlain != null ? passPlain : prefs.getString("pass", ""));
+        passInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+
+        root.addView(fieldBox("Host / IP server", hostInput), marginTop(matchWrap(), 8));
+        root.addView(fieldBox("Port", portInput), marginTop(matchWrap(), 10));
+        root.addView(fieldBox("Username (opsional)", userInput), marginTop(matchWrap(), 10));
+        root.addView(fieldBox("Password (opsional)", passInput), marginTop(matchWrap(), 10));
+
+        // ── Tombol utama ──
+        connectButton = button("Connect");
+        connectButton.setBackgroundColor(GREEN);
+        connectButton.setOnClickListener(v -> onToggleConnection());
+        root.addView(connectButton, marginTop(matchWrap(), 20));
+
+        // ── Kartu status: tepat di bawah tombol ──
+        // Status dan counter menempel ke tombol Connect supaya mata langsung
+        // melihat hasil tekanannya, bukan terpisah di dasar layar.
         LinearLayout statusCard = new LinearLayout(this);
         statusCard.setOrientation(LinearLayout.HORIZONTAL);
         statusCard.setGravity(Gravity.CENTER_VERTICAL);
-        statusCard.setPadding(dp(16), dp(14), dp(16), dp(14));
+        statusCard.setPadding(dp(16), dp(16), dp(16), dp(16));
         statusCard.setBackgroundColor(CARD);
 
         statusDot = new View(this);
@@ -174,62 +194,64 @@ public class MainActivity extends Activity {
         trafficText = text("\u2191 0 B   \u2193 0 B", 12, false, TEXT_SECONDARY);
         statusCol.addView(trafficText, marginTop(matchWrap(), 3));
 
+        pingText = text("", 11, false, TEXT_SECONDARY);
+        statusCol.addView(pingText, marginTop(matchWrap(), 2));
+
         statusCard.addView(statusCol, new LinearLayout.LayoutParams(0, -2, 1f));
-        root.addView(statusCard, marginTop(matchWrap(), 22));
-
-        // Field
-        hostInput = textInput("Contoh: 10.12.132.225", prefs.getString("host", ""));
-        portInput = numberInput("1080", prefs.getInt("port", 1080));
-        userInput = textInput("Kosongkan bila server tanpa auth", prefs.getString("user", ""));
-        String passPlain = SecurePrefs.decrypt(this, prefs.getString("pass_enc", null));
-        passInput = textInput("Kosongkan bila server tanpa auth",
-                passPlain != null ? passPlain : prefs.getString("pass", ""));
-        passInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-
-        root.addView(fieldBox("Host / IP server", hostInput), marginTop(matchWrap(), 16));
-        root.addView(fieldBox("Port", portInput), marginTop(matchWrap(), 10));
-        root.addView(fieldBox("Username (opsional)", userInput), marginTop(matchWrap(), 10));
-        root.addView(fieldBox("Password (opsional)", passInput), marginTop(matchWrap(), 10));
-
-        // Tombol utama
-        connectButton = button("Connect");
-        connectButton.setBackgroundColor(GREEN);
-        connectButton.setOnClickListener(v -> onToggleConnection());
-        root.addView(connectButton, marginTop(matchWrap(), 20));
-
-        // HTTP ping
-        CheckBox pingCheck = new CheckBox(this);
-        pingCheck.setText("HTTP ping (keep-alive tiap 30 detik)");
-        pingCheck.setTextColor(TEXT_PRIMARY);
-        pingCheck.setTextSize(13);
-        boolean pingEnabled = getSharedPreferences(STATUS_PREFS, MODE_PRIVATE)
-                .getBoolean("ping_enabled", false);
-        pingCheck.setChecked(pingEnabled);
-        pingCheck.setOnCheckedChangeListener((v, checked) ->
-                getSharedPreferences(STATUS_PREFS, MODE_PRIVATE).edit()
-                        .putBoolean("ping_enabled", checked).apply());
-        root.addView(pingCheck, marginTop(matchWrap(), 14));
-
-        pingText = text("", 12, false, TEXT_SECONDARY);
-        root.addView(pingText, marginTop(matchWrap(), 2));
-
-        // Spacer: dorong footer ke bawah saat layar tinggi, tapi tetap bisa
-        // di-scroll saat konten lebih panjang dari layar.
-        View spacer = new View(this);
-        root.addView(spacer, new LinearLayout.LayoutParams(-1, 0, 1f));
-
-        // Info Developer
-        Button infoDev = button("Info Developer");
-        infoDev.setBackgroundColor(BLUE);
-        infoDev.setOnClickListener(v -> showDeveloperInfo());
-        root.addView(infoDev, marginTop(matchWrap(), 22));
-
-        TextView foot = text("Semua trafik TCP, UDP dan DNS keluar lewat server SOCKS5 kamu.",
-                11, false, Color.rgb(92, 99, 112));
-        foot.setGravity(Gravity.CENTER);
-        root.addView(foot, marginTop(matchWrap(), 18));
+        root.addView(statusCard, marginTop(matchWrap(), 12));
 
         return scroll;
+    }
+
+    // ----------------------------------------------
+    // Menu titik tiga
+    // ----------------------------------------------
+
+    /**
+     * Menu titik tiga: dua toggle langsung + About.
+     *
+     * Toggle ditampilkan sebagai item menu yang bisa dicentang (centang = hidup,
+     * kosong = mati). Tidak ada dialog perantara dan tidak ada item "Pengaturan" -
+     * begitu menu dibuka, status kedua opsi langsung terlihat dan bisa diubah
+     * dengan satu ketukan.
+     *
+     * PopupMenu tidak membalik nilai sendiri, jadi tiap klik membaca nilai
+     * sekarang lalu menulis kebalikannya.
+     */
+    private void showOverflowMenu(View anchor) {
+        SharedPreferences sp = getSharedPreferences(STATUS_PREFS, MODE_PRIVATE);
+        boolean pingOn = sp.getBoolean(TunnelState.KEY_PING_ENABLED, false);
+        boolean counterOn = sp.getBoolean(TunnelState.KEY_TRAFFIC_ENABLED, true);
+
+        PopupMenu menu = new PopupMenu(this, anchor);
+
+        MenuItem itemPing = menu.getMenu().add(0, MENU_PING, 0, "HTTP ping");
+        itemPing.setCheckable(true);
+        itemPing.setChecked(pingOn);
+
+        MenuItem itemCounter = menu.getMenu().add(0, MENU_COUNTER, 1, "Counter");
+        itemCounter.setCheckable(true);
+        itemCounter.setChecked(counterOn);
+
+        menu.getMenu().add(0, MENU_ABOUT, 2, "About");
+
+        menu.setOnMenuItemClickListener(item -> {
+            SharedPreferences.Editor ed = sp.edit();
+            switch (item.getItemId()) {
+                case MENU_PING:
+                    ed.putBoolean(TunnelState.KEY_PING_ENABLED, !pingOn).apply();
+                    return true;
+                case MENU_COUNTER:
+                    ed.putBoolean(TunnelState.KEY_TRAFFIC_ENABLED, !counterOn).apply();
+                    return true;
+                case MENU_ABOUT:
+                    showDeveloperInfo();
+                    return true;
+                default:
+                    return false;
+            }
+        });
+        menu.show();
     }
 
     // ----------------------------------------------
@@ -237,9 +259,9 @@ public class MainActivity extends Activity {
     // ----------------------------------------------
 
     private void onToggleConnection() {
-        SharedPreferences statusPrefs = getSharedPreferences(STATUS_PREFS, MODE_PRIVATE);
-        boolean connected = statusPrefs.getBoolean(KEY_CONNECTED, false);
-        if (connected || isVpnServiceAlive()) {
+        // Fase eksplisit, bukan flag boolean yang bisa tertinggal basi.
+        if (TunnelState.isConnected(this) || TunnelState.isConnecting(this)
+                || isVpnServiceAlive()) {
             stopVpn();
         } else {
             prepareAndConnect();
@@ -265,19 +287,49 @@ public class MainActivity extends Activity {
             return;
         }
 
+        final String user = userInput.getText().toString().trim();
+        final String pass = passInput.getText().toString();
+
         connectButton.setEnabled(false);
-        statusText.setText("Menyiapkan VPN...");
         statusText.setTextColor(ACCENT);
+        statusText.setText("Cek host dan port...");
+        saveState(TunnelState.PHASE_CONNECTING, "Cek host dan port...");
 
         prefs.edit()
                 .putString("host", host)
                 .putInt("port", port)
-                .putString("user", userInput.getText().toString().trim())
-                .putString("pass_enc", SecurePrefs.encrypt(this, passInput.getText().toString()))
+                .putString("user", user)
+                .putString("pass_enc", SecurePrefs.encrypt(this, pass))
                 .remove("pass") // jangan tinggalkan bekas plaintext
                 .apply();
 
+        // Preflight di thread latar: cek TCP + handshake SOCKS5 dulu, baru minta
+        // izin VPN. Kalau server mati atau password salah, tunnel tidak pernah
+        // sempat naik dan pengguna langsung tahu sebabnya.
         new Thread(() -> {
+            String err = Preflight.check(host, port, user, pass, msg ->
+                    handler.post(() -> {
+                        statusText.setTextColor(ACCENT);
+                        statusText.setText(msg);
+                    }));
+
+            if (err != null) {
+                handler.post(() -> {
+                    statusText.setText(err);
+                    statusText.setTextColor(RED);
+                    connectButton.setEnabled(true);
+                    saveState(TunnelState.PHASE_IDLE, err);
+                });
+                return;
+            }
+
+            // Server lolos cek - sekarang minta izin VPN lalu naikkan tunnel.
+            handler.post(() -> {
+                statusText.setTextColor(ACCENT);
+                statusText.setText("Server siap, menyiapkan VPN...");
+                saveState(TunnelState.PHASE_CONNECTING, "Menyiapkan VPN...");
+            });
+
             try {
                 Intent vpnIntent = VpnService.prepare(MainActivity.this);
                 handler.post(() -> {
@@ -305,10 +357,7 @@ public class MainActivity extends Activity {
 
     /** Bootstrap dan rule anti-loop hanya aman kalau host berupa IP literal. */
     private static boolean isIpLiteral(String host) {
-        if (host == null) return false;
-        String h = host.trim();
-        if (h.matches("^\\d{1,3}(\\.\\d{1,3}){3}$")) return true;
-        return h.contains(":") && h.matches("^[0-9a-fA-F:]+$");
+        return Preflight.isIpLiteral(host);
     }
 
     private void startVpn() {
@@ -322,7 +371,7 @@ public class MainActivity extends Activity {
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
             else startService(intent);
         } catch (Throwable e) {
-            saveStatus(false, "Gagal start VPN: " + safeMessage(e));
+            saveState(TunnelState.PHASE_IDLE, "Gagal start VPN: " + safeMessage(e));
         }
         refreshUi();
     }
@@ -345,7 +394,7 @@ public class MainActivity extends Activity {
                 handler.post(this::refreshUi);
             }).start();
         } catch (Throwable e) {
-            saveStatus(false, "Stop error: " + safeMessage(e));
+            saveState(TunnelState.PHASE_IDLE, "Stop error: " + safeMessage(e));
             refreshUi();
         }
     }
@@ -355,60 +404,74 @@ public class MainActivity extends Activity {
     // ----------------------------------------------
 
     private void refreshUi() {
-        SharedPreferences sp = getSharedPreferences(STATUS_PREFS, MODE_PRIVATE);
-        boolean connected = sp.getBoolean(KEY_CONNECTED, false);
+        SharedPreferences sp = TunnelState.prefs(this);
 
-        // Service menulis heartbeat tiap 10 detik; kalau berhenti menulis,
-        // anggap tunnel mati walau flag connected masih true.
-        if (connected && !isVpnServiceAlive()) {
-            connected = false;
-            saveStatus(false, "Disconnected");
+        // Fase dibaca eksplisit. "Connected" hanya sah kalau service masih
+        // menulis heartbeat; kalau service dibunuh paksa, UI ikut turun.
+        String phase = TunnelState.phase(this);
+        boolean alive = TunnelState.PHASE_CONNECTED.equals(phase);
+        boolean connecting = TunnelState.PHASE_CONNECTING.equals(phase);
+
+        if (alive && !TunnelState.isAlive(this) && !isVpnServiceAlive()) {
+            alive = false;
+            TunnelState.idle(this, "Disconnected");
+            phase = TunnelState.PHASE_IDLE;
         }
 
-        String status = sp.getString(KEY_STATUS, "");
-        boolean connecting = status != null
-                && status.toLowerCase(Locale.US).contains("connect")
-                && !status.equalsIgnoreCase("Connected")
-                && !status.equalsIgnoreCase("Disconnected");
-        boolean alive = connected || isVpnServiceAlive();
+        String message = TunnelState.message(this);
+        if (message == null || message.trim().isEmpty()) {
+            message = alive ? "Connected" : connecting ? "Connecting..." : "Disconnected";
+        }
 
-        // Status
+        // Status: pesan ditampilkan apa adanya, warna mengikuti fase.
+        statusText.setText(message);
         if (alive) {
-            statusText.setText("Connected");
             statusText.setTextColor(GREEN);
             statusDot.setBackgroundColor(GREEN);
         } else if (connecting) {
-            statusText.setText("Connecting...");
             statusText.setTextColor(ACCENT);
             statusDot.setBackgroundColor(ACCENT);
         } else {
-            statusText.setText("Disconnected");
-            statusText.setTextColor(TEXT_SECONDARY);
-            statusDot.setBackgroundColor(DOT_OFF);
+            // Bukan "Disconnected" berarti ini pesan kegagalan preflight.
+            boolean gagal = !"Disconnected".equalsIgnoreCase(message);
+            statusText.setTextColor(gagal ? RED : TEXT_SECONDARY);
+            statusDot.setBackgroundColor(gagal ? RED : DOT_OFF);
         }
 
-        // Traffic
+        // Counter: disembunyikan sepenuhnya saat dimatikan lewat menu,
+        // supaya tidak ada angka basi yang menempel di kartu status.
         if (trafficText != null) {
-            long up = sp.getLong(KEY_UP, 0);
-            long down = sp.getLong(KEY_DOWN, 0);
-            trafficText.setText("\u2191 " + formatBytes(up) + "   \u2193 " + formatBytes(down));
+            boolean counterOn = sp.getBoolean(TunnelState.KEY_TRAFFIC_ENABLED, true);
+            if (counterOn) {
+                // Saat tidak tersambung, tampilkan nol - bukan angka sisa sesi
+                // sebelumnya. Service mereset counter waktu disconnect, tapi UI
+                // bisa sempat menggambar nilai lama sebelum tulisan itu masuk.
+                long up = alive ? sp.getLong(KEY_UP, 0) : 0;
+                long down = alive ? sp.getLong(KEY_DOWN, 0) : 0;
+                trafficText.setVisibility(View.VISIBLE);
+                trafficText.setText("\u2191 " + formatBytes(up) + "   \u2193 " + formatBytes(down));
+            } else {
+                trafficText.setVisibility(View.GONE);
+            }
         }
 
         // Ping
         if (pingText != null) {
-            boolean pingEnabled = sp.getBoolean("ping_enabled", false);
-            String pingResult = sp.getString("ping_result", null);
-            if (pingResult != null) {
-                pingText.setText("Ping: " + pingResult);
+            boolean pingEnabled = sp.getBoolean(TunnelState.KEY_PING_ENABLED, false);
+            String pingResult = sp.getString(TunnelState.KEY_PING_RESULT, null);
+            if (!pingEnabled || !alive) {
+                pingText.setVisibility(View.GONE);
             } else {
-                pingText.setText(pingEnabled
-                        ? (alive ? "Ping: menunggu hasil..." : "")
-                        : "");
+                pingText.setVisibility(View.VISIBLE);
+                pingText.setText(pingResult != null
+                        ? "Ping " + pingResult
+                        : "Ping: menunggu hasil...");
             }
         }
 
         // Tombol
-        if (alive || connecting) {
+        boolean active = alive || connecting;
+        if (active) {
             connectButton.setText("Disconnect");
             connectButton.setBackgroundColor(RED);
             connectButton.setEnabled(true);
@@ -418,7 +481,7 @@ public class MainActivity extends Activity {
             connectButton.setEnabled(true);
         }
 
-        boolean lock = alive || connecting;
+        boolean lock = active;
         hostInput.setEnabled(!lock);
         portInput.setEnabled(!lock);
         userInput.setEnabled(!lock);
@@ -429,19 +492,13 @@ public class MainActivity extends Activity {
         // ada tulisan lagi - satu cek ulang setelah jendela heartbeat lewat
         // cukup untuk menyadarinya, tanpa membangunkan CPU terus-menerus.
         handler.removeCallbacks(aliveRecheck);
-        if (alive) handler.postDelayed(aliveRecheck, LAST_SEEN_WINDOW_MS + 5000);
+        if (alive) handler.postDelayed(aliveRecheck, TunnelState.LAST_SEEN_WINDOW_MS + 5000);
     }
 
     private final Runnable aliveRecheck = this::refreshUi;
 
     private boolean isVpnServiceAlive() {
-        SharedPreferences sp = getSharedPreferences(STATUS_PREFS, MODE_PRIVATE);
-        long lastSeen = sp.getLong(KEY_LAST_SEEN, 0);
-        // Service menulis heartbeat tiap 10 detik, jadi jendela ini harus >= 3x
-        // interval supaya Doze/layar mati sesaat tidak dibaca sebagai service mati.
-        if (lastSeen > 0 && (System.currentTimeMillis() - lastSeen) < LAST_SEEN_WINDOW_MS) {
-            return true;
-        }
+        if (TunnelState.isAlive(this)) return true;
         ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
         if (am == null) return false;
         for (ActivityManager.RunningServiceInfo info : am.getRunningServices(Integer.MAX_VALUE)) {
@@ -453,12 +510,14 @@ public class MainActivity extends Activity {
         return false;
     }
 
-    private void saveStatus(boolean connected, String status) {
-        getSharedPreferences(STATUS_PREFS, MODE_PRIVATE)
-                .edit()
-                .putBoolean(KEY_CONNECTED, connected)
-                .putString(KEY_STATUS, status)
-                .apply();
+    private void saveState(String phase, String message) {
+        if (TunnelState.PHASE_CONNECTED.equals(phase)) {
+            TunnelState.connected(this, message);
+        } else if (TunnelState.PHASE_CONNECTING.equals(phase)) {
+            TunnelState.connecting(this, message);
+        } else {
+            TunnelState.idle(this, message);
+        }
     }
 
     private String safeMessage(Throwable e) {

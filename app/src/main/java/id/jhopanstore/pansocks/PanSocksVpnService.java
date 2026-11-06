@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.ConnectivityManager;
+import android.net.TrafficStats;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -23,28 +24,20 @@ import android.os.ParcelFileDescriptor;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 
-import io.nekohasekai.libbox.BridgeOptions;
-import io.nekohasekai.libbox.BridgeSession;
-import io.nekohasekai.libbox.CommandServer;
-import io.nekohasekai.libbox.CommandServerHandler;
-import io.nekohasekai.libbox.ConnectionOwner;
-import io.nekohasekai.libbox.OverrideOptions;
-import io.nekohasekai.libbox.LocalDNSTransport;
-import io.nekohasekai.libbox.NeighborUpdateListener;
-import io.nekohasekai.libbox.InterfaceUpdateListener;
-import io.nekohasekai.libbox.Libbox;
-import io.nekohasekai.libbox.NetworkInterface;
-import io.nekohasekai.libbox.NetworkInterfaceIterator;
-import io.nekohasekai.libbox.PlatformInterface;
-import io.nekohasekai.libbox.PlatformUser;
-import io.nekohasekai.libbox.ShellSession;
-import io.nekohasekai.libbox.RoutePrefix;
-import io.nekohasekai.libbox.RoutePrefixIterator;
-import io.nekohasekai.libbox.SetupOptions;
-import io.nekohasekai.libbox.StringIterator;
-import io.nekohasekai.libbox.SystemProxyStatus;
-import io.nekohasekai.libbox.TunOptions;
-import io.nekohasekai.libbox.WIFIState;
+import io.github.sagernet.libbox.libbox.BoxService;
+import io.github.sagernet.libbox.libbox.InterfaceUpdateListener;
+import io.github.sagernet.libbox.libbox.Libbox;
+import io.github.sagernet.libbox.libbox.NetworkInterface;
+import io.github.sagernet.libbox.libbox.NetworkInterfaceIterator;
+import io.github.sagernet.libbox.libbox.PlatformInterface;
+import io.github.sagernet.libbox.libbox.RoutePrefix;
+import io.github.sagernet.libbox.libbox.RoutePrefixIterator;
+import io.github.sagernet.libbox.libbox.SetupOptions;
+import io.github.sagernet.libbox.libbox.StringBox;
+import io.github.sagernet.libbox.libbox.StringIterator;
+import io.github.sagernet.libbox.libbox.SystemProxyStatus;
+import io.github.sagernet.libbox.libbox.TunOptions;
+import io.github.sagernet.libbox.libbox.WIFIState;
 
 import java.net.Inet4Address;
 import java.util.ArrayList;
@@ -53,7 +46,11 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public class PanSocksVpnService extends VpnService implements PlatformInterface, CommandServerHandler {
+public class PanSocksVpnService extends VpnService implements PlatformInterface {
+
+    // API libbox v1.11.15 (sama dengan PanTunnel yang sudah stabil).
+    // Berbeda dari v1.14: service dijalankan lewat Libbox.newService() +
+    // service.start(), bukan CommandServer.startOrReloadService().
     static final String ACTION_CONNECT = "id.jhopanstore.pansocks.CONNECT";
     static final String ACTION_DISCONNECT = "id.jhopanstore.pansocks.DISCONNECT";
     static final String EXTRA_HOST = "host";
@@ -64,14 +61,14 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
     private static final String TAG = "PanSocksVpnService";
     private static final String CHANNEL_ID = "pansocks";
     private static final int NOTIF_ID = 11;
-    private static final String PREFS = "pansocks_status";
-    private static final String KEY_CONNECTED = "connected";
-    private static final String KEY_STATUS = "status";
-    private static final String KEY_LAST_SEEN = "last_seen";
-    private static final String KEY_TRAFFIC_ENABLED = "traffic_counter_enabled";
+    // State tunnel ditulis lewat TunnelState supaya MainActivity dan service
+    // tidak lagi memakai skema berbeda (itu pernah membuat UI macet di
+    // "Menyiapkan VPN..." padahal tunnel sudah tersambung).
+    private static final String PREFS = TunnelState.PREFS;
+    private static final String KEY_LAST_SEEN = TunnelState.KEY_LAST_SEEN;
+    private static final String KEY_TRAFFIC_ENABLED = TunnelState.KEY_TRAFFIC_ENABLED;
     private static final String KEY_UPLOAD_BYTES = "upload_bytes";
     private static final String KEY_DOWNLOAD_BYTES = "download_bytes";
-    private static final String TUN_IFACE = "sb-tun";
     private static final long TRAFFIC_POLL_MS = 10000;
 
     // ── HTTP ping ──
@@ -99,7 +96,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
     private volatile boolean running;
     private volatile boolean connecting;
     private volatile boolean stopping;
-    private CommandServer commandServer;
+    private BoxService boxService;
     private ParcelFileDescriptor vpnFd;
     private Thread heartbeatThread;
 
@@ -118,6 +115,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
     private final AtomicLong downloadBytes = new AtomicLong(0);
     private volatile boolean trafficCounterEnabled;
     private Thread trafficThread;
+    private SharedPreferences.OnSharedPreferenceChangeListener trafficToggleListener;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -213,7 +211,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
      * memicu restart berulang.
      */
     private void onNetworkChanged(String reason) {
-        if (!running || stopping || connecting || commandServer == null) return;
+        if (!running || stopping || connecting || boxService == null) return;
         long now = System.currentTimeMillis();
         if (now - lastNetworkRestart < 15000) return;
         lastNetworkRestart = now;
@@ -222,7 +220,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         worker.execute(() -> {
             try {
                 String config = buildSingBoxConfig(serverHost, serverPort, serverUser, serverPass, null);
-                commandServer.startOrReloadService(config, new OverrideOptions());
+                startBoxService(config);
                 setStatus(true, "Connected");
                 notifyStatus("Connected");
                 logI("reloaded after network change");
@@ -263,16 +261,13 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
             Libbox.setup(setupOptions);
 
             // Start command server (holds the platform bridge and the box instance)
-            commandServer = Libbox.newCommandServer(this, this);
-            commandServer.start();
-
             // Build config dan start service (bind_interface = null, pakai auto_detect_interface)
             String config = buildSingBoxConfig(host.trim(), port, user, pass, null);
             logI("starting sing-box, config-length=" + config.length() + ", auto_detect_interface");
             if (BuildConfig.DEBUG) {
                 logI("config: " + redactSecrets(config));
             }
-            commandServer.startOrReloadService(config, new OverrideOptions());
+            startBoxService(config);
 
             serverHost = host.trim();
             serverPort = port;
@@ -289,8 +284,12 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
             registerNetworkWatchdog();
             startHeartbeat();
             startPingMonitor();
-            resetTrafficCounters();
             loadTrafficToggle();
+            registerTrafficToggleListener();
+            // Counter dihitung per sesi: mulai dari nol tiap connect baru, lalu
+            // dihapus saat disconnect. Tanpa reset di sini, angka sesi lama ikut
+            // terbawa karena TrafficStats menghitung total seumur proses.
+            resetTrafficCounters();
             startTrafficMonitor();
             logI("VPN connected successfully");
 
@@ -318,6 +317,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
 
         logI("disconnectInternal");
         unregisterNetworkWatchdog();
+        unregisterTrafficToggleListener();
         stopHeartbeat();
         stopPingMonitor();
         stopTrafficMonitor();
@@ -342,14 +342,9 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         }
 
         try {
-            if (commandServer != null) {
-                commandServer.closeService();
-                commandServer.close();
-            }
+            closeBoxService();
         } catch (Throwable t) {
-            logE("disconnectCoreOnly close commandServer", t);
-        } finally {
-            commandServer = null;
+            logE("disconnectCoreOnly close box", t);
         }
 
         if (vpnFd != null) {
@@ -373,8 +368,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         heartbeatThread = new Thread(() -> {
             while (running && !stopping) {
                 try {
-                    SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-                    sp.edit().putLong(KEY_LAST_SEEN, System.currentTimeMillis()).apply();
+                    TunnelState.touch(this);
                     Thread.sleep(HEARTBEAT_MS);
                 } catch (InterruptedException e) {
                     break;
@@ -401,6 +395,41 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
     private void loadTrafficToggle() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         trafficCounterEnabled = sp.getBoolean(KEY_TRAFFIC_ENABLED, true);
+    }
+
+    /**
+     * Toggle counter dari menu Pengaturan harus berlaku tanpa reconnect.
+     * Listener ini menyalakan/mematikan thread monitor saat nilainya berubah.
+     */
+    private void registerTrafficToggleListener() {
+        if (trafficToggleListener != null) return;
+        trafficToggleListener = (sp, key) -> {
+            if (!KEY_TRAFFIC_ENABLED.equals(key)) return;
+            boolean on = sp.getBoolean(KEY_TRAFFIC_ENABLED, true);
+            if (on == trafficCounterEnabled) return;
+            trafficCounterEnabled = on;
+            if (on) {
+                startTrafficMonitor();
+            } else {
+                stopTrafficMonitor();
+                // Sembunyikan angka lama supaya UI tidak menampilkan data basi.
+                sp.edit()
+                        .putLong(KEY_UPLOAD_BYTES, 0)
+                        .putLong(KEY_DOWNLOAD_BYTES, 0)
+                        .apply();
+                uploadBytes.set(0);
+                downloadBytes.set(0);
+            }
+        };
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .registerOnSharedPreferenceChangeListener(trafficToggleListener);
+    }
+
+    private void unregisterTrafficToggleListener() {
+        if (trafficToggleListener == null) return;
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .unregisterOnSharedPreferenceChangeListener(trafficToggleListener);
+        trafficToggleListener = null;
     }
 
     /** Toggle the traffic counter on/off at runtime. Persists across reconnects. */
@@ -481,55 +510,33 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
     }
 
     /**
-     * Read TX/RX bytes from the TUN interface via sysfs.
-     * Returns [txBytes, rxBytes]. Falls back to [-1, -1] on error.
+     * Baca total byte TX/RX milik proses app.
+     *
+     * Versi sebelumnya membaca /sys/class/net/sb-tun/statistics/* dan jatuh ke
+     * /proc/net/dev. Dua-duanya tidak bisa dipakai:
+     *
+     *  - Android memberi nama interface TUN sendiri (di perangkat uji: tun1),
+     *    mengabaikan interface_name dari config, jadi "sb-tun" tidak pernah ada;
+     *  - statistik interface dilindungi SELinux: /sys/class/net/tun1/statistics/*
+     *    DAN /proc/net/dev sama-sama "Permission denied" untuk uid app, bahkan
+     *    tanpa root. Jadi membaca statistik interface memang mustahil dari app.
+     *
+     * TrafficStats menghitung byte per-uid lewat kernel, tanpa perlu izin
+     * tambahan. Karena seluruh trafik tunnel keluar lewat socket SOCKS proses
+     * ini, angkanya mewakili pemakaian tunnel.
+     *
+     * @return [txBytes, rxBytes], atau [-1, -1] bila tidak tersedia.
      */
     private long[] readTunTraffic() {
-        long tx = -1, rx = -1;
-        try {
-            // Try sysfs first (most reliable)
-            tx = readLongFromFile("/sys/class/net/" + TUN_IFACE + "/statistics/tx_bytes");
-            rx = readLongFromFile("/sys/class/net/" + TUN_IFACE + "/statistics/rx_bytes");
-        } catch (Exception ignored) {
-        }
-
-        // Fallback: parse /proc/net/dev
+        long tx = TrafficStats.getUidTxBytes(android.os.Process.myUid());
+        long rx = TrafficStats.getUidRxBytes(android.os.Process.myUid());
         if (tx < 0 || rx < 0) {
-            try {
-                java.io.BufferedReader br = new java.io.BufferedReader(
-                        new java.io.FileReader("/proc/net/dev"));
-                String line;
-                while ((line = br.readLine()) != null) {
-                    line = line.trim();
-                    if (line.startsWith(TUN_IFACE + ":")) {
-                        String[] parts = line.split("\\s+");
-                        // Format: iface: rxBytes rxPackets ... txBytes txPackets ...
-                        // Index:  0      1        2           9        10
-                        if (parts.length >= 11) {
-                            String rxStr = parts[1];
-                            // Handle "iface:rxBytes" format (no space after colon)
-                            if (rxStr.contains(":")) {
-                                rxStr = rxStr.substring(rxStr.indexOf(':') + 1);
-                            }
-                            rx = Long.parseLong(rxStr);
-                            tx = Long.parseLong(parts[9]);
-                        }
-                        break;
-                    }
-                }
-                br.close();
-            } catch (Exception ignored) {
-            }
+            // Perangkat sangat lama / API tanpa dukungan per-uid: pakai total.
+            tx = TrafficStats.getTotalTxBytes();
+            rx = TrafficStats.getTotalRxBytes();
         }
-
+        if (tx < 0 || rx < 0) return new long[]{-1, -1};
         return new long[]{tx, rx};
-    }
-
-    private long readLongFromFile(String path) throws Exception {
-        java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(path));
-        String val = br.readLine();
-        br.close();
-        return Long.parseLong(val.trim());
     }
 
     private String formatBytes(long bytes) {
@@ -552,52 +559,79 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         return h.contains(":") && h.matches("^[0-9a-fA-F:]+$");
     }
 
+    /**
+     * Jalankan core sing-box v1.11.
+     *
+     * v1.11 tidak punya CommandServer.startOrReloadService(). Polanya:
+     *   service = Libbox.newService(config, platform)
+     *   service.start()
+     * dan untuk reload cukup tutup service lama lalu buat yang baru.
+     */
+    private void startBoxService(String config) throws Exception {
+        closeBoxService();
+        // checkConfig menolak config yang tidak valid SEBELUM tunnel naik, jadi
+        // kesalahan format ketahuan sebagai pesan jelas - bukan tunnel yang
+        // "Connected" tapi tidak mengalirkan apa pun.
+        Libbox.checkConfig(config);
+        BoxService svc = Libbox.newService(config, this);
+        svc.start();
+        boxService = svc;
+    }
+
+    private void closeBoxService() {
+        if (boxService == null) return;
+        try {
+            boxService.close();
+        } catch (Throwable ignored) {
+        }
+        boxService = null;
+    }
+
+    /**
+     * Bangun config sing-box untuk core v1.11.15.
+     *
+     * Format di bawah sengaja memakai dialek v1.11 - bukan dialek baru 1.12+.
+     * Perbedaan yang penting:
+     *   - DNS  : {"address":"tcp://1.1.1.1"}  (bukan {"type":"tcp","server":"..."})
+     *   - TUN  : "inet4_address":"172.19.0.1/30" (bukan "address":[...])
+     *   - route: tidak ada "default_domain_resolver" di v1.11
+     *   - sniff: masih field di inbound, bukan action di route
+     */
     private String buildSingBoxConfig(String host, int port, String user, String pass, String bindIface) {
         StringBuilder sb = new StringBuilder();
         sb.append("{");
 
-        // ── Log ──
+        // Log
         String logLevel = BuildConfig.DEBUG ? "debug" : "warn";
         sb.append("\"log\":{\"level\":\"").append(logLevel).append("\",\"timestamp\":true},");
 
-        // ── DNS ──
-        // New server format (sing-box >= 1.12; the legacy "address" field was
-        // removed in 1.14, which is the core this app ships). Everything is
-        // resolved through the SOCKS tunnel; "local" is only the bootstrap that
-        // resolves the server hostname itself.
+        // DNS - dialek v1.11: skema protokol ada DI DALAM field "address".
+        // Semua resolver diarahkan ke SOCKS lewat detour; "local" hanya bootstrap
+        // untuk me-resolve hostname server (kalau host berupa nama).
         sb.append("\"dns\":{");
         sb.append("\"servers\":[");
-        sb.append("{\"tag\":\"remote\",\"type\":\"tcp\",\"server\":\"1.1.1.1\",\"detour\":\"socks-out\"},");
-        sb.append("{\"tag\":\"remote-udp\",\"type\":\"udp\",\"server\":\"1.1.1.1\",\"detour\":\"socks-out\"},");
-        // Backup resolver. sing-box has no automatic failover between servers, so
-        // this one is here to be promoted by changing "final" when 1.1.1.1 is
-        // blocked on the network you are on.
-        sb.append("{\"tag\":\"backup\",\"type\":\"tcp\",\"server\":\"8.8.8.8\",\"detour\":\"socks-out\"},");
-        sb.append("{\"tag\":\"local\",\"type\":\"local\"}");
+        sb.append("{\"tag\":\"remote\",\"address\":\"tcp://1.1.1.1\",\"detour\":\"socks-out\"},");
+        sb.append("{\"tag\":\"remote-udp\",\"address\":\"udp://1.1.1.1\",\"detour\":\"socks-out\"},");
+        // Backup: dipromosikan dengan mengubah "final" bila 1.1.1.1 diblokir.
+        sb.append("{\"tag\":\"backup\",\"address\":\"tcp://8.8.8.8\",\"detour\":\"socks-out\"},");
+        sb.append("{\"tag\":\"local\",\"address\":\"local\"}");
         sb.append("],");
         sb.append("\"final\":\"remote\",");
         sb.append("\"strategy\":\"ipv4_only\"");
         sb.append("},");
 
-        // ── Inbounds (TUN) ──
+        // Inbound TUN
         sb.append("\"inbounds\":[{\"type\":\"tun\",\"tag\":\"tun-in\",\"interface_name\":\"sb-tun\",");
-        sb.append("\"address\":[\"172.19.0.1/30\"],\"mtu\":1400,");
+        sb.append("\"inet4_address\":\"172.19.0.1/30\",\"mtu\":1400,");
         sb.append("\"auto_route\":true,\"strict_route\":true,");
-        // gVisor stack: L3-L4 translation happens in userspace, so the tunnel
-        // does not depend on the device's kernel/driver quirks. Same choice as
-        // the desktop client.
+        sb.append("\"sniff\":true,\"sniff_override_destination\":false,");
         sb.append("\"stack\":\"gvisor\"");
-        // Inbound loopback untuk HTTP ping (PING_PORT). Hanya 127.0.0.1, jadi
-        // tidak ada yang bisa menyentuhnya dari luar perangkat.
+        // Inbound loopback untuk HTTP ping: hanya 127.0.0.1, tidak bisa disentuh dari luar.
         sb.append("},{\"type\":\"mixed\",\"tag\":\"ping-in\",\"listen\":\"127.0.0.1\",\"listen_port\":").append(PING_PORT);
-        // NOTE: "sniff"/"sniff_override_destination" lived here until sing-box
-        // 1.13 removed legacy inbound fields - sniffing is a route action now.
         sb.append("}],");
 
-        // ── Outbounds ──
+        // Outbound
         sb.append("\"outbounds\":[");
-
-        // SOCKS5 outbound
         sb.append("{\"type\":\"socks\",\"tag\":\"socks-out\",");
         sb.append("\"server\":\"").append(escapeJson(host)).append("\",");
         sb.append("\"server_port\":").append(port).append(",");
@@ -606,53 +640,33 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
             sb.append(",\"username\":\"").append(escapeJson(user.trim())).append("\"");
             sb.append(",\"password\":\"").append(escapeJson(pass)).append("\"");
         }
-        // bind_interface agar koneksi ke SOCKS server keluar dari interface
-        // fisik, bukan berbalik masuk ke TUN.
         if (bindIface != null && !bindIface.isEmpty()) {
             sb.append(",\"bind_interface\":\"").append(escapeJson(bindIface)).append("\"");
         }
         sb.append("},");
-
-        // Direct outbound (bootstrap + bypass IP server SOCKS)
         sb.append("{\"type\":\"direct\",\"tag\":\"direct\"");
         if (bindIface != null && !bindIface.isEmpty()) {
             sb.append(",\"bind_interface\":\"").append(escapeJson(bindIface)).append("\"");
         }
-        sb.append("}");
+        sb.append("}],");
 
-        sb.append("],");
-
-        // ── Route ──
+        // Route
         sb.append("\"route\":{");
         sb.append("\"auto_detect_interface\":true,");
-        // Resolver untuk hostname server (bootstrap) - lihat blok dns di atas.
-        sb.append("\"default_domain_resolver\":{\"server\":\"local\"},");
         sb.append("\"rules\":[");
-        // Lapis anti-DNS-leak: SEMUA paket DNS (termasuk yang menembak resolver
-        // LAN/ISP) ditangkap di sini dan dijawab server "remote" lewat socks-out.
-        // Sebelumnya memakai block port-53 yang khas sing-box 1.10; "action"
-        // hijack-dns tersedia sejak 1.11 dan core kita 1.14.
-        // Sniff only DNS: the tun inbound auto-hijacks UDP DNS aimed at the VPN
-        // DNS address (tun address + 1), but queries to any other resolver - a
-        // hardcoded one in some app, or DNS over TCP after a truncated answer -
-        // are only recognised as DNS by sniffing. In sing-box 1.14 the sniff
-        // action carries no destination override, so this cannot rewrite where a
-        // connection goes.
+        // Anti DNS leak: SEMUA paket DNS ditangkap dan dijawab resolver "remote"
+        // lewat socks-out, termasuk query ke resolver LAN/ISP.
         sb.append("{\"action\":\"sniff\",\"sniffer\":[\"dns\"]},");
         sb.append("{\"protocol\":\"dns\",\"action\":\"hijack-dns\"},");
-
-        // IPv6: the route still sends ::/0 into the tunnel (that is what stops a
-        // v6 leak), but DNS is ipv4_only so no AAAA ever resolves. Reject v6
-        // here so apps fail instantly instead of hanging on a dead socket.
+        // IPv6 masuk tunnel lalu ditolak: aplikasi gagal cepat, bukan menggantung,
+        // dan tidak ada jalur v6 yang bocor.
         sb.append("{\"ip_cidr\":[\"::/0\"],\"action\":\"reject\"},");
-
         // Server SOCKS -> direct (anti routing loop)
         if (isIpLiteral(host)) {
             sb.append("{\"ip_cidr\":[\"").append(escapeJson(host)).append("/32\"],\"outbound\":\"direct\"}");
         } else {
             sb.append("{\"domain\":[\"").append(escapeJson(host)).append("\"],\"outbound\":\"direct\"}");
         }
-
         sb.append("],");
         sb.append("\"final\":\"socks-out\"");
         sb.append("},");
@@ -661,8 +675,8 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         return sb.toString();
     }
 
-    // ──────────────────────────────────────────────
-    // Helpers
+    // ----------------------------------------------
+
     // ──────────────────────────────────────────────
 
     private String escapeJson(String s) {
@@ -675,12 +689,11 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
     }
 
     private void setStatus(boolean connected, String status) {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        sp.edit()
-                .putBoolean(KEY_CONNECTED, connected)
-                .putString(KEY_STATUS, status)
-                .putLong(KEY_LAST_SEEN, System.currentTimeMillis())
-                .apply();
+        if (connected) {
+            TunnelState.connected(this, status);
+        } else {
+            TunnelState.idle(this, status);
+        }
     }
 
     private void notifyStatus(String content) {
@@ -780,14 +793,22 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         long next = 0;
         while (pingRunning) {
             SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+            // running = tunnel sudah naik. Sebelumnya syarat ini memakai field
+            // `running` milik service, tapi hasil "gagal" dari percobaan saat
+            // inbound belum siap tertinggal di prefs dan tampil seolah error
+            // permanen ("Failed to connect to /127.0.0.1:2081") padahal tunnel
+            // sudah sehat dan ping berikutnya 204.
             boolean enabled = sp.getBoolean(PING_PREFS_KEY, false) && running;
             if (!enabled) {
                 sp.edit().remove(PING_RESULT_KEY).apply();
                 next = 0;
             } else if (System.currentTimeMillis() >= next) {
+                // Buang hasil lama dulu: UI tidak boleh menampilkan angka basi
+                // selama percobaan baru berjalan.
+                sp.edit().remove(PING_RESULT_KEY).apply();
                 String result = pingOnce();
                 if (pingRunning) sp.edit().putString(PING_RESULT_KEY, result).apply();
-                boolean ok = result != null && result.startsWith("204");
+                boolean ok = result != null && result.startsWith("OK");
                 next = System.currentTimeMillis() + (ok ? PING_INTERVAL_MS : PING_RETRY_MS);
             }
             try {
@@ -833,7 +854,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
                 if (code == 204) {
                     // Sengaja TIDAK memanggil disconnect(): itu akan menutup koneksi
                     // yang sudah dibangun dan menghapus manfaat keep-alive.
-                    return "204 " + ms + "ms";
+                    return "OK " + ms + " ms";
                 }
                 lastErr = "HTTP " + code;
             } catch (Throwable t) {
@@ -876,10 +897,11 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
     }
 
     @Override
-    public ConnectionOwner findConnectionOwner(int protocol, String source, int sourcePort,
-                                                String destination, int destinationPort) throws Exception {
-        // Only used to label connections in the (unused) dashboard API.
-        return new ConnectionOwner();
+    public int findConnectionOwner(int ipProtocol, String sourceAddress, int sourcePort,
+                                   String destinationAddress, int destinationPort) throws Exception {
+        // v1.11 mengembalikan uid (int32), bukan objek ConnectionOwner.
+        // Dipakai hanya untuk melabeli koneksi di API dashboard yang tidak kita pakai.
+        return -1;
     }
 
     @Override
@@ -911,7 +933,7 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
 
                     // Wrap ke StringIterator
                     final List<String> addrList = new ArrayList<>(addrs);
-                    libIf.setAddresses(new io.nekohasekai.libbox.StringIterator() {
+                    libIf.setAddresses(new StringIterator() {
                         int i = 0;
                         @Override public boolean hasNext() { return i < addrList.size(); }
                         @Override public String next() { return addrList.get(i++); }
@@ -992,15 +1014,16 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
             // 1.1.1.1 at the OS layer would give apps a resolver OUTSIDE the
             // core's DNS path - the classic DNS leak. Queries may only go to
             // the tunnel DNS (which the core hijacks and answers via socks-out).
-            io.nekohasekai.libbox.StringIterator dnsServers = options.getDNSServerAddress();
-            while (dnsServers != null && dnsServers.hasNext()) {
-                String dns = dnsServers.next();
-                if (dns == null || dns.trim().isEmpty()) continue;
-                try {
-                    builder.addDnsServer(dns);
-                } catch (Exception e) {
-                    // Log.w(TAG, "addDnsServer failed: " + dns, e);
+            // v1.11: GetDNSServerAddress() mengembalikan *StringBox (satu alamat),
+            // bukan iterator. Nilai null/error berarti tidak ada DNS dari core.
+            try {
+                StringBox dnsBox = options.getDNSServerAddress();
+                String dns = dnsBox == null ? null : dnsBox.getValue();
+                if (dns != null && !dns.trim().isEmpty()) {
+                    builder.addDnsServer(dns.trim());
                 }
+            } catch (Exception e) {
+                // Tidak ada DNS dari core: biarkan builder tanpa DNS server.
             }
 
             // IPv4 routes
@@ -1073,8 +1096,38 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         return new WIFIState("", "");
     }
 
+    /**
+     * v1.11 memakai WriteLog(); v1.14 menggantinya dengan writeDebugMessage()
+     * di CommandServerHandler. Keduanya hanya meneruskan pesan core ke log kita.
+     */
     @Override
-    public void sendNotification(io.nekohasekai.libbox.Notification notification) throws Exception {
+    public void writeLog(String message) {
+        logI("libbox: " + message);
+    }
+
+    /**
+     * v1.11 memakai dua method ini (v1.14 menghapusnya). Dipakai core untuk
+     * memetakan koneksi ke aplikasi pemiliknya; kita tidak memakai API
+     * dashboard, jadi cukup mengembalikan nilai kosong.
+     */
+    @Override
+    public String packageNameByUid(int uid) throws Exception {
+        String[] pkgs = getPackageManager().getPackagesForUid(uid);
+        return (pkgs != null && pkgs.length > 0) ? pkgs[0] : null;
+    }
+
+    @Override
+    public int uidByPackageName(String packageName) throws Exception {
+        try {
+            return getPackageManager().getApplicationInfo(packageName, 0).uid;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    @Override
+    public void sendNotification(io.github.sagernet.libbox.libbox.Notification notification)
+            throws Exception {
         String body = notification == null ? "Running" : notification.getBody();
         notifyStatus(body == null || body.isEmpty() ? "Running" : body);
     }
@@ -1152,107 +1205,4 @@ public class PanSocksVpnService extends VpnService implements PlatformInterface,
         return false;
     }
 
-    @Override
-    public boolean usePlatformBridge() {
-        return false;
-    }
-
-    @Override
-    public boolean usePlatformShell() {
-        return false;
-    }
-
-    @Override
-    public String tailscaleHostname() {
-        return "";
-    }
-
-    @Override
-    public String lookupSFTPServer() {
-        return "";
-    }
-
-    @Override
-    public String readSystemSSHHostKey() {
-        return "";
-    }
-
-    @Override
-    public void registerMyInterface(String name) {
-    }
-
-    @Override
-    public PlatformUser lookupUser(String username) {
-        return null;
-    }
-
-    @Override
-    public ShellSession openShellSession(PlatformUser user, String command, StringIterator args,
-                                         String environment, int columns, int rows) {
-        return null;
-    }
-
-    @Override
-    public LocalDNSTransport localDNSTransport() {
-        return null;
-    }
-
-    @Override
-    public BridgeSession createBridge(BridgeOptions options) {
-        return null;
-    }
-
-    @Override
-    public void checkPlatformShell() {
-    }
-
-    @Override
-    public void startNeighborMonitor(NeighborUpdateListener listener) {
-    }
-
-    @Override
-    public void closeNeighborMonitor(NeighborUpdateListener listener) {
-    }
-
-    @Override
-    public void cancelNotification(String tag, int id) {
-    }
-
-    // ══════════════════════════════════════════════
-    // CommandServerHandler implementation
-    // ══════════════════════════════════════════════
-
-    @Override
-    public SystemProxyStatus getSystemProxyStatus() {
-        return new SystemProxyStatus();
-    }
-
-    @Override
-    public void serviceStop() {
-        logI("serviceStop requested by sing-box");
-        new Thread(this::disconnectInternal, "sb-serviceStop").start();
-    }
-
-    @Override
-    public int connectSSHAgent() {
-        return -1;
-    }
-
-    @Override
-    public void triggerNativeCrash() {
-    }
-
-    @Override
-    public void writeDebugMessage(String message) {
-        logI("libbox: " + message);
-    }
-
-    @Override
-    public void serviceReload() throws Exception {
-        logI("serviceReload requested");
-    }
-
-    @Override
-    public void setSystemProxyEnabled(boolean b) throws Exception {
-    }
 }

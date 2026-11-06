@@ -222,11 +222,30 @@ Checklist manual di perangkat:
 |---|---|
 | GUI | Java (tanpa XML layout, tanpa dependency eksternal) |
 | TUN | `VpnService` + gvisor |
-| Core | sing-box 1.14.1 minimal (`libbox.aar`) |
+| Core | sing-box 1.11.15 minimal (`libbox.aar`) |
 | RAM idle | ~50 MB |
 | Binary | 16–32 MB |
 | DNS | hijack + VPN DNS |
 | Min Android | 7.0 (API 24) |
+| Ukuran APK | ~7,6 MB (arm64-v8a) · ~15,2 MB (universal) |
+
+### Kenapa core dipaku di v1.11.15
+
+Versi ini dipilih karena terbukti stabil di PanTunnel, dan menghasilkan binary
+yang jauh lebih kecil. Membandingkan `libbox.so` versi v1.14.1 (51,4 MB) dengan
+v1.11.15 (23 MB): selisih terbesar ada di tabel relokasi `.data.rel.ro`
+(21 MB vs 2,7 MB), bukan di kode protokol — protokolnya justru sudah dipangkas
+di sini.
+
+Dua hal yang membuat v1.14 membengkak dan sengaja dihindari:
+
+- build tag `badlinkname` (untuk mengakali `//go:linkname`) — membuat tabel
+  relokasi membengkak ~8x. Tidak dibutuhkan klien SOCKS5.
+- versi core yang lebih baru menambah metadata tipe meski protokolnya tidak dipakai.
+
+Konsekuensinya: config memakai dialek v1.11 (`"address":"tcp://1.1.1.1"`,
+`"inet4_address"`, tanpa `default_domain_resolver`). Format 1.12+ akan ditolak
+core ini, jadi ubah config builder kalau versi core dinaikkan lagi.
 
 ## Kredit
 

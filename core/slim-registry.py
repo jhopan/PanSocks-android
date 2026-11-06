@@ -51,6 +51,7 @@ DROP_CALLS = [
     "registerUSBIPServices(registry)",
     "redirect.RegisterRedirect(registry)",
     "redirect.RegisterTProxy(registry)",
+    "http.RegisterInbound(registry)",
     "shadowsocks.RegisterInbound(registry)",
     "snell.RegisterInbound(registry)",
     "vmess.RegisterInbound(registry)",
@@ -79,18 +80,36 @@ DROP_CALLS = [
 ]
 
 # Must survive the trim, otherwise we would ship a broken core.
+# Yang benar-benar dipakai config PanSocks:
+#   inbound  : tun (jalur utama) + mixed (loopback HTTP ping di 127.0.0.1:2081)
+#   outbound : socks (server SOCKS5) + direct (bootstrap & anti-loop) + block (reject)
+#   dns      : tcp + udp lewat detour socks, dan "local" sebagai bootstrap
+#
+# mixed sudah mencakup HTTP, jadi http inbound tidak perlu didaftarkan terpisah.
+# http OUTBOUND tetap dibutuhkan: preflight ping memakai Proxy.Type.HTTP.
+# Catatan versi: di sing-box >= 1.12 "local" adalah transport DNS yang
+# didaftarkan di include/registry.go (local.RegisterTransport). Di v1.11
+# transport "local" didaftarkan dari Go lewat RegisterLocalDNSTransport()
+# di experimental/libbox/dns.go, jadi tidak muncul di registry sama sekali.
+# Keduanya sah - penanda di bawah menyesuaikan diri dengan versi sumbernya.
 KEEP = [
     "tun.RegisterInbound(registry)",
     "socks.RegisterInbound(registry)",
-    "http.RegisterInbound(registry)",
     "mixed.RegisterInbound(registry)",
     "direct.RegisterInbound(registry)",
     "direct.RegisterOutbound(registry)",
     "block.RegisterOutbound(registry)",
     "socks.RegisterOutbound(registry)",
     "http.RegisterOutbound(registry)",
-    "local.RegisterTransport(registry)",
 ]
+
+# Wajib ada, tapi lokasinya berbeda antar versi.
+KEEP_ANYWHERE = {
+    "dns local transport": [
+        "local.RegisterTransport(registry)",      # >= 1.12
+        "RegisterLocalDNSTransport",              # 1.11.x (di dns.go)
+    ],
+}
 
 
 def main() -> int:
@@ -109,6 +128,28 @@ def main() -> int:
         (dropped if hits else missing).append(call)
 
     absent = [marker for marker in KEEP if marker not in src]
+
+    # Penanda yang boleh berada di file lain: cek di seluruh tree sumber, bukan
+    # hanya registry.go, karena letaknya berubah antar versi sing-box.
+    for label, alternatif in KEEP_ANYWHERE.items():
+        root = path.parent.parent
+        ketemu = False
+        for alt in alternatif:
+            if alt in src:
+                ketemu = True
+                break
+            for gofile in root.rglob("*.go"):
+                try:
+                    if alt in gofile.read_text(encoding="utf-8", errors="ignore"):
+                        ketemu = True
+                        break
+                except OSError:
+                    continue
+            if ketemu:
+                break
+        if not ketemu:
+            absent.append(f"{label} ({' atau '.join(alternatif)})")
+
     if absent:
         print("ERROR: registry shape changed, keeping these is required:", file=sys.stderr)
         for marker in absent:

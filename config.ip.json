@@ -7,25 +7,22 @@
     "servers": [
       {
         "tag": "remote",
-        "type": "tcp",
-        "server": "1.1.1.1",
+        "address": "tcp://1.1.1.1",
         "detour": "socks-out"
       },
       {
         "tag": "remote-udp",
-        "type": "udp",
-        "server": "1.1.1.1",
+        "address": "udp://1.1.1.1",
         "detour": "socks-out"
       },
       {
         "tag": "backup",
-        "type": "tcp",
-        "server": "8.8.8.8",
+        "address": "tcp://8.8.8.8",
         "detour": "socks-out"
       },
       {
         "tag": "local",
-        "type": "local"
+        "address": "local"
       }
     ],
     "final": "remote",
@@ -36,12 +33,12 @@
       "type": "tun",
       "tag": "tun-in",
       "interface_name": "sb-tun",
-      "address": [
-        "172.19.0.1/30"
-      ],
+      "inet4_address": "172.19.0.1/30",
       "mtu": 1400,
       "auto_route": true,
       "strict_route": true,
+      "sniff": true,
+      "sniff_override_destination": false,
       "stack": "gvisor"
     },
     {
@@ -56,10 +53,8 @@
       "type": "socks",
       "tag": "socks-out",
       "server": "10.12.132.225",
-      "server_port": 1080,
-      "version": "5",
-      "username": "user",
-      "password": "pass"
+      "server_port": 9999,
+      "version": "5"
     },
     {
       "type": "direct",
@@ -68,9 +63,6 @@
   ],
   "route": {
     "auto_detect_interface": true,
-    "default_domain_resolver": {
-      "server": "local"
-    },
     "rules": [
       {
         "action": "sniff",
