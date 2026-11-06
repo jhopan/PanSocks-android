@@ -13,8 +13,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 WAJIB. Checkout default hanya mengambil 1 commit tanpa
+      # tag, sedangkan scripts/changelog.sh membaca riwayat antar-tag. Dengan
+      # depth 1 hasilnya selalu "tidak ada perubahan".
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -100,6 +105,23 @@ jobs:
             echo "SIZE_UNIV=$(mb $(stat -c%s "PanSocks-${VERSION}-universal.apk"))"
           } >> $GITHUB_ENV
 
+      # Catatan rilis dihasilkan dari riwayat commit antar-tag, bukan ditulis
+      # tangan. Bagian "Pilih file" dan ukurannya juga sudah otomatis, jadi
+      # tidak ada lagi angka atau daftar yang bisa basi.
+      - name: Generate changelog
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          # Tag rilis sebelumnya, urut versi (bukan urut tanggal commit).
+          PREV=$(git tag --sort=-v:refname | grep -E '^v[0-9]' \
+                 | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
+          echo "tag sebelumnya: ${PREV:-<tidak ada>}"
+          {
+            echo "CHANGELOG<<__CHANGELOG_EOF__"
+            bash scripts/changelog.sh "$PREV" "${GITHUB_REF_NAME}"
+            echo "__CHANGELOG_EOF__"
+          } >> "$GITHUB_ENV"
+
       - name: Write SHA256SUMS
         run: |
           cd app/build/outputs/apk/release
@@ -137,24 +159,7 @@ jobs:
           body: |
             ## PanSocks ${{ env.VERSION }} — Android
 
-            **Yang baru**
-
-            - Ukuran APK turun **88%**: 51,5 MB -> 5,9 MB. Tiga penyebabnya:
-              `libbox.so` tidak dikompres di APK, build tag `badlinkname` yang
-              membuat tabel relokasi membengkak ~8x, dan core sing-box v1.14
-              yang jauh lebih besar.
-            - Core dipaku ke **sing-box v1.11.15** (sama seperti PanTunnel).
-            - **Preflight**: TCP + handshake SOCKS5 diperiksa dulu. Server mati
-              atau password salah ketahuan dalam detik, dan tunnel tidak pernah naik.
-            - **Counter traffic diperbaiki**. Statistik interface tidak bisa dibaca
-              app (dilindungi SELinux), jadi sekarang dihitung per-uid lewat
-              `TrafficStats`. Dihitung per sesi: mulai 0 saat connect, dihapus
-              saat disconnect.
-            - **UI tidak lagi macet** di "Menyiapkan VPN..." dengan tombol yang
-              tidak bisa ditekan.
-            - Menu titik tiga: toggle **HTTP ping** dan **Counter** (centang = hidup).
-            - Header dihapus, status dan counter menempel di bawah tombol Connect.
-
+            ${{ env.CHANGELOG }}
             ### Pilih file
 
             | File | Untuk siapa | Ukuran |
